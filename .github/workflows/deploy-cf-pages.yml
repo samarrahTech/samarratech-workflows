@@ -1,0 +1,77 @@
+name: Deploy to Cloudflare Pages
+
+# Reusable deploy for static-export Next.js sites on Cloudflare Pages.
+# Callers need: secrets.CLOUDFLARE_API_TOKEN (pass explicitly or use
+# `secrets: inherit`) and vars.CLOUDFLARE_ACCOUNT_ID (read directly from
+# the caller's repo/org variables).
+
+on:
+  workflow_call:
+    inputs:
+      project-name:
+        description: Cloudflare Pages project name
+        type: string
+        required: true
+      output-dir:
+        description: Build output directory to deploy
+        type: string
+        default: out
+      run-checks:
+        description: Run typecheck + tests before building
+        type: boolean
+        default: true
+      build-env:
+        description: |
+          Extra KEY=VALUE lines exported before the build (repo vars only —
+          never put secrets in inputs).
+        type: string
+        default: ''
+      wrangler-version:
+        description: wrangler major version for wrangler-action
+        type: string
+        default: '4'
+    secrets:
+      CLOUDFLARE_API_TOKEN:
+        required: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: package.json
+          cache: npm
+
+      - run: npm ci
+
+      - name: Typecheck
+        if: ${{ inputs.run-checks }}
+        run: |
+          npm run typecheck --if-present
+          npm run check-types --if-present
+
+      - name: Test
+        if: ${{ inputs.run-checks }}
+        run: npm test --if-present
+
+      # Input goes through env, never interpolated into the script body
+      # (github.com/github/docs — script injection).
+      - name: Set build env
+        if: ${{ inputs.build-env != '' }}
+        env:
+          BUILD_ENV: ${{ inputs.build-env }}
+        run: printf '%s\n' "$BUILD_ENV" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: npm run build
+
+      - name: Deploy to Cloudflare Pages
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          wranglerVersion: ${{ inputs.wrangler-version }}
+          command: pages deploy ${{ inputs.output-dir }} --project-name=${{ inputs.project-name }}

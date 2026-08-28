@@ -1,0 +1,14 @@
+# Drop-in replacement for a repo's .github/workflows/ci.yml
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  ci:
+    uses: samarrahTech/samarratech-workflows/.github/workflows/node-ci.yml@v1
+    # with:
+    #   run-tests: false          # repos with no test suite yet
+    #   working-directory: worker # nested packages

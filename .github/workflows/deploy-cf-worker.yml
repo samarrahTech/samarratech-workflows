@@ -1,0 +1,74 @@
+name: Deploy Cloudflare Worker
+
+# Reusable deploy for Cloudflare Workers (wrangler.toml in the package dir).
+# Callers need: secrets.CLOUDFLARE_API_TOKEN and vars.CLOUDFLARE_ACCOUNT_ID.
+# Set sync-slack-webhook: true to also push secrets.SLACK_WEBHOOK_URL to the
+# worker on each deploy (fleet alerting convention).
+
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        description: Package directory containing wrangler.toml
+        type: string
+        default: '.'
+      run-checks:
+        description: Run typecheck + tests before deploying
+        type: boolean
+        default: true
+      sync-slack-webhook:
+        description: Sync SLACK_WEBHOOK_URL to the worker as a secret
+        type: boolean
+        default: false
+    secrets:
+      CLOUDFLARE_API_TOKEN:
+        required: true
+      SLACK_WEBHOOK_URL:
+        required: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: ${{ inputs.working-directory }}/package.json
+          cache: npm
+          cache-dependency-path: ${{ inputs.working-directory }}/package-lock.json
+
+      - run: npm ci
+
+      - name: Typecheck
+        if: ${{ inputs.run-checks }}
+        run: |
+          npm run typecheck --if-present
+          npm run check-types --if-present
+
+      - name: Test
+        if: ${{ inputs.run-checks }}
+        run: npm test --if-present
+
+      - name: Deploy
+        if: ${{ !inputs.sync-slack-webhook }}
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: ${{ inputs.working-directory }}
+
+      - name: Deploy (with Slack webhook sync)
+        if: ${{ inputs.sync-slack-webhook }}
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: ${{ inputs.working-directory }}
+          secrets: |
+            SLACK_WEBHOOK_URL
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}

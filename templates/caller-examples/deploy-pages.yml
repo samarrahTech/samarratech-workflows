@@ -1,0 +1,16 @@
+# Drop-in replacement for a Cloudflare Pages repo's .github/workflows/deploy.yml
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    uses: samarrahTech/samarratech-workflows/.github/workflows/deploy-cf-pages.yml@v1
+    with:
+      project-name: my-pages-project
+      # build-env: |
+      #   NEXT_PUBLIC_SOME_KEY=${{ vars.NEXT_PUBLIC_SOME_KEY }}
+    secrets: inherit

@@ -1,0 +1,83 @@
+name: E2E (Playwright)
+
+# Reusable Playwright E2E job: install browsers, start the app, wait for it,
+# run the suite. Test-account credentials come from the caller's secrets
+# (both optional — static suites need neither).
+
+on:
+  workflow_call:
+    inputs:
+      start-command:
+        description: Command that starts the app (run in the background)
+        type: string
+        default: npm run dev
+      url:
+        description: URL to wait for before running tests
+        type: string
+        default: http://localhost:3000
+      browsers:
+        description: Playwright browsers to install
+        type: string
+        default: chromium
+      test-command:
+        description: Command that runs the suite
+        type: string
+        default: npx playwright test
+      run-env:
+        description: Extra KEY=VALUE lines exported before start/test (non-secret)
+        type: string
+        default: ''
+    secrets:
+      TEST_USER_EMAIL:
+        required: false
+      TEST_USER_PASSWORD:
+        required: false
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    env:
+      TEST_USER_EMAIL: ${{ secrets.TEST_USER_EMAIL }}
+      TEST_USER_PASSWORD: ${{ secrets.TEST_USER_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: package.json
+          cache: npm
+
+      - run: npm ci
+
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps ${{ inputs.browsers }}
+
+      # Inputs go through env, never interpolated into the script body
+      # (github.com/github/docs — script injection).
+      - name: Set run env
+        if: ${{ inputs.run-env != '' }}
+        env:
+          RUN_ENV: ${{ inputs.run-env }}
+        run: printf '%s\n' "$RUN_ENV" >> "$GITHUB_ENV"
+
+      - name: Start the app
+        env:
+          START_COMMAND: ${{ inputs.start-command }}
+          APP_URL: ${{ inputs.url }}
+        run: |
+          eval "$START_COMMAND" &
+          npx wait-on "$APP_URL" --timeout 60000
+
+      - name: Run E2E suite
+        env:
+          TEST_COMMAND: ${{ inputs.test-command }}
+        run: eval "$TEST_COMMAND"
+
+      - name: Upload Playwright report
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: playwright-report/
+          retention-days: 7
+          if-no-files-found: ignore
