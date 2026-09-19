@@ -20,6 +20,10 @@ on:
         description: Sync SLACK_WEBHOOK_URL to the worker as a secret
         type: boolean
         default: false
+      wrangler-version:
+        description: wrangler major version for wrangler-action
+        type: string
+        default: '4'
     secrets:
       CLOUDFLARE_API_TOKEN:
         required: true
@@ -33,9 +37,9 @@ jobs:
       run:
         working-directory: ${{ inputs.working-directory }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version-file: ${{ inputs.working-directory }}/package.json
           cache: npm
@@ -55,19 +59,21 @@ jobs:
 
       - name: Deploy
         if: ${{ !inputs.sync-slack-webhook }}
-        uses: cloudflare/wrangler-action@v3
+        uses: cloudflare/wrangler-action@v4
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
           workingDirectory: ${{ inputs.working-directory }}
+          wranglerVersion: ${{ inputs.wrangler-version }}
 
       - name: Deploy (with Slack webhook sync)
         if: ${{ inputs.sync-slack-webhook }}
-        uses: cloudflare/wrangler-action@v3
+        uses: cloudflare/wrangler-action@v4
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
           workingDirectory: ${{ inputs.working-directory }}
+          wranglerVersion: ${{ inputs.wrangler-version }}
           secrets: |
             SLACK_WEBHOOK_URL
         env:
