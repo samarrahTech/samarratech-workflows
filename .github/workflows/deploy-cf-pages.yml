@@ -30,14 +30,45 @@ on:
         description: wrangler major version for wrangler-action
         type: string
         default: '4'
+      branch:
+        description: |
+          Deploy as a preview on this Pages branch (e.g. `pr-123`) instead of
+          production. Letters, digits, `.`, `_` and `-` only. Empty = production.
+        type: string
+        default: ''
     secrets:
       CLOUDFLARE_API_TOKEN:
         required: true
+    outputs:
+      deployment-url:
+        description: URL of this deployment (the per-deployment *.pages.dev URL)
+        value: ${{ jobs.deploy.outputs.deployment-url }}
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    outputs:
+      deployment-url: ${{ steps.deploy.outputs.deployment-url }}
     steps:
+      # These three inputs end up on the wrangler command line, so reject
+      # anything that is not a plain name before doing any work. The match is
+      # on the whole string (a per-line grep would pass a multi-line value).
+      - name: Check inputs
+        env:
+          PROJECT_NAME: ${{ inputs.project-name }}
+          OUTPUT_DIR: ${{ inputs.output-dir }}
+          BRANCH: ${{ inputs.branch }}
+        run: |
+          fail() { echo "::error::$1"; exit 1; }
+          [[ "$PROJECT_NAME" =~ ^[A-Za-z0-9._-]+$ ]] || fail "project-name must match [A-Za-z0-9._-]+"
+          [[ "$OUTPUT_DIR" =~ ^[A-Za-z0-9._/-]+$ ]] || fail "output-dir must match [A-Za-z0-9._/-]+"
+          if [[ -n "$BRANCH" ]]; then
+            [[ "$BRANCH" =~ ^[A-Za-z0-9._-]+$ ]] || fail "branch must match [A-Za-z0-9._-]+"
+            case "$BRANCH" in
+              main|master|production) fail "branch '$BRANCH' is a production branch name; previews need their own name (e.g. pr-123)" ;;
+            esac
+          fi
+
       - uses: actions/checkout@v7
 
       - uses: actions/setup-node@v7
@@ -69,9 +100,22 @@ jobs:
         run: npm run build
 
       - name: Deploy to Cloudflare Pages
+        id: deploy
         uses: cloudflare/wrangler-action@v4
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
           wranglerVersion: ${{ inputs.wrangler-version }}
-          command: pages deploy ${{ inputs.output-dir }} --project-name=${{ inputs.project-name }}
+          command: pages deploy ${{ inputs.output-dir }} --project-name=${{ inputs.project-name }}${{ inputs.branch != '' && format(' --branch={0}', inputs.branch) || '' }}
+
+      # A preview exists to be tested by a later job. Fail here, with the
+      # reason, rather than handing that job an empty URL.
+      - name: Check the preview URL
+        if: ${{ inputs.branch != '' }}
+        env:
+          DEPLOYMENT_URL: ${{ steps.deploy.outputs.deployment-url }}
+        run: |
+          if [[ -z "$DEPLOYMENT_URL" ]]; then
+            echo "::error::wrangler-action returned no deployment-url for the preview deploy"; exit 1
+          fi
+          echo "Preview: $DEPLOYMENT_URL" >> "$GITHUB_STEP_SUMMARY"
