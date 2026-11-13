@@ -1,0 +1,44 @@
+# PR dogfood for a Cloudflare Pages site: deploy a preview of the PR, then run
+# GreenCI against it. Save as .github/workflows/dogfood.yml.
+#
+# Both `uses:` lines must point at a ref that has greenci.yml and the `branch`
+# input (added Nov 2026). Use the same ref for both.
+name: Dogfood
+
+on:
+  pull_request:
+    # labeled/unlabeled so adding or removing `skip-dogfood` takes effect at once.
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+    paths-ignore: ['**.md', 'docs/**']
+
+concurrency:
+  group: dogfood-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  preview:
+    # Fork and Dependabot PRs get no secrets, so the deploy could only fail.
+    # Add the `skip-dogfood` label to skip one PR.
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.actor != 'dependabot[bot]' &&
+      !contains(github.event.pull_request.labels.*.name, 'skip-dogfood')
+    uses: samarrahTech/samarratech-workflows/.github/workflows/deploy-cf-pages.yml@v1
+    with:
+      project-name: my-pages-project
+      branch: pr-${{ github.event.pull_request.number }}
+      # The repo's CI workflow already runs typecheck and tests on the PR.
+      run-checks: false
+    secrets: inherit
+
+  greenci:
+    needs: preview
+    permissions:
+      contents: read
+      pull-requests: write
+    uses: samarrahTech/samarratech-workflows/.github/workflows/greenci.yml@v1
+    with:
+      channel: v1 # `main` on canary repos only
+      base-url: ${{ needs.preview.outputs.deployment-url }}
+    secrets:
+      GREENCI_API_KEY: ${{ secrets.GREENCI_API_KEY }}

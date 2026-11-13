@@ -1,0 +1,183 @@
+name: GreenCI
+
+# Reusable GreenCI run for a pull request: generate and run E2E tests for the
+# diff, then comment the result on the PR.
+#
+# Callers need:
+#   - secrets.GREENCI_API_KEY (pass explicitly or use `secrets: inherit`).
+#     Without it the job explains the skip and passes, so fork PRs (which get
+#     no secrets) do not look like failures.
+#   - job permissions `contents: read` and `pull-requests: write` on the
+#     calling job. A reusable workflow cannot hold more than its caller grants.
+#
+# Read-only by design: GreenCI reports on the PR and never commits to the
+# branch, so the job that runs model-written tests holds no write access to
+# the repository contents.
+#
+# Test target: either a URL that is already live (pass `base-url`, leave
+# `start-command` empty — e.g. the preview from deploy-cf-pages.yml), or a
+# local server (pass `start-command`, and `build-command` if it needs one).
+
+on:
+  workflow_call:
+    inputs:
+      channel:
+        description: |
+          greenci-action ref to run: `v1` (the released tag customers use) or
+          `main` (canary repos only).
+        type: string
+        default: v1
+      base-url:
+        description: URL GreenCI tests against
+        type: string
+        default: http://localhost:3000
+      build-command:
+        description: Command that builds the app before start-command (optional)
+        type: string
+        default: ''
+      start-command:
+        description: |
+          Command that serves the app at base-url (run in the background).
+          Leave empty when base-url is already live.
+        type: string
+        default: ''
+      run-env:
+        description: Extra KEY=VALUE lines exported before build/start (non-secret)
+        type: string
+        default: ''
+      mode:
+        description: greenci-action mode
+        type: string
+        default: generate
+      project-id:
+        description: GreenCI project id for dashboard trace uploads (optional)
+        type: string
+        default: ''
+    secrets:
+      GREENCI_API_KEY:
+        required: false
+      TEST_USER_EMAIL:
+        required: false
+      TEST_USER_PASSWORD:
+        required: false
+
+jobs:
+  greenci:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      pull-requests: write
+    env:
+      # The `secrets` context is not available in `if:`, so the presence check
+      # goes through env.
+      HAS_API_KEY: ${{ secrets.GREENCI_API_KEY != '' && 'yes' || 'no' }}
+    steps:
+      # Without this, a fork PR and an unconfigured repo both look like a
+      # genuine failure. Say which it is.
+      - name: Explain why GreenCI was skipped
+        if: env.HAS_API_KEY != 'yes'
+        run: |
+          echo "::notice title=GreenCI skipped::GREENCI_API_KEY is not set for this run." \
+               "Fork pull requests do not receive secrets, which is expected." \
+               "If this is not a fork, add the GREENCI_API_KEY repository secret."
+
+      # Inputs go through env, never interpolated into the script body
+      # (github.com/github/docs — script injection).
+      - name: Check inputs
+        if: env.HAS_API_KEY == 'yes'
+        env:
+          CHANNEL: ${{ inputs.channel }}
+          APP_URL: ${{ inputs.base-url }}
+        run: |
+          if [[ -z "$APP_URL" ]]; then
+            echo "::error::base-url is empty. If it comes from a preview deploy job, that job produced no deployment-url."; exit 1
+          fi
+          case "$CHANNEL" in
+            v1|main) ;;
+            *) echo "::error::channel must be 'v1' or 'main', got '$CHANNEL'"; exit 1 ;;
+          esac
+
+      - uses: actions/checkout@v7
+        if: env.HAS_API_KEY == 'yes'
+        with:
+          # This job runs model-written test code. Do not leave the repo token
+          # in .git/config where that code can read it.
+          persist-credentials: false
+
+      - uses: actions/setup-node@v7
+        if: env.HAS_API_KEY == 'yes'
+        with:
+          node-version-file: package.json
+          cache: npm
+
+      - run: npm ci
+        if: env.HAS_API_KEY == 'yes'
+
+      - name: Set run env
+        if: ${{ env.HAS_API_KEY == 'yes' && inputs.run-env != '' }}
+        env:
+          RUN_ENV: ${{ inputs.run-env }}
+        run: printf '%s\n' "$RUN_ENV" >> "$GITHUB_ENV"
+
+      - name: Build
+        if: ${{ env.HAS_API_KEY == 'yes' && inputs.build-command != '' }}
+        env:
+          BUILD_COMMAND: ${{ inputs.build-command }}
+        run: eval "$BUILD_COMMAND"
+
+      # Start and wait in one step: if the start command dies, the step fails
+      # right away instead of after a wait-on timeout in a later step.
+      - name: Start the app and wait for it
+        if: env.HAS_API_KEY == 'yes'
+        env:
+          START_COMMAND: ${{ inputs.start-command }}
+          APP_URL: ${{ inputs.base-url }}
+        run: |
+          if [[ -z "$START_COMMAND" ]]; then
+            npx --yes wait-on "$APP_URL" --timeout 120000
+            exit 0
+          fi
+          eval "$START_COMMAND" &
+          app=$!
+          npx --yes wait-on "$APP_URL" --timeout 120000 &
+          waiter=$!
+          # A start command that exits 0 may have put the server in the
+          # background itself, so only a non-zero exit counts as a failure.
+          while kill -0 "$waiter" 2>/dev/null; do
+            if [[ -n "$app" ]] && ! kill -0 "$app" 2>/dev/null; then
+              if ! wait "$app"; then
+                echo "::error::start-command failed before $APP_URL answered"; exit 1
+              fi
+              app=''
+            fi
+            sleep 1
+          done
+          wait "$waiter"
+
+      # `uses:` cannot take an expression, so the channel is selected by
+      # checking the action out at that ref and running it from a local path.
+      # The action commits through the GitHub API by file path, so this
+      # directory never reaches the PR branch.
+      - name: Fetch greenci-action
+        if: env.HAS_API_KEY == 'yes'
+        uses: actions/checkout@v7
+        with:
+          repository: samarrahTech/greenci-action
+          ref: ${{ inputs.channel }}
+          path: .greenci-action
+          persist-credentials: false
+
+      - name: Run GreenCI
+        if: env.HAS_API_KEY == 'yes'
+        uses: ./.greenci-action
+        with:
+          api-key: ${{ secrets.GREENCI_API_KEY }}
+          mode: ${{ inputs.mode }}
+          base-url: ${{ inputs.base-url }}
+          auto-commit: 'false'
+          project-id: ${{ inputs.project-id }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          TEST_USER_EMAIL: ${{ secrets.TEST_USER_EMAIL }}
+          TEST_USER_PASSWORD: ${{ secrets.TEST_USER_PASSWORD }}
