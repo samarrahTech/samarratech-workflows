@@ -53,6 +53,24 @@ on:
         description: GreenCI project id for dashboard trace uploads (optional)
         type: string
         default: ''
+      min-tests-generated:
+        description: |
+          Fail the job when GreenCI generates fewer tests than this. 0 (the
+          default) accepts a run where the model found nothing to test. A
+          canary PR whose change is known to be testable sets 1, so a declined
+          run cannot pass as a green 0/0.
+        type: number
+        default: 0
+    outputs:
+      tests-generated:
+        description: Number of tests GreenCI generated (empty when the run was skipped)
+        value: ${{ jobs.greenci.outputs.tests-generated }}
+      tests-passed:
+        description: Number of generated tests that passed
+        value: ${{ jobs.greenci.outputs.tests-passed }}
+      tests-failed:
+        description: Number of generated tests that failed
+        value: ${{ jobs.greenci.outputs.tests-failed }}
     secrets:
       GREENCI_API_KEY:
         required: false
@@ -72,6 +90,10 @@ jobs:
       # The `secrets` context is not available in `if:`, so the presence check
       # goes through env.
       HAS_API_KEY: ${{ secrets.GREENCI_API_KEY != '' && 'yes' || 'no' }}
+    outputs:
+      tests-generated: ${{ steps.greenci.outputs.tests-generated }}
+      tests-passed: ${{ steps.greenci.outputs.tests-passed }}
+      tests-failed: ${{ steps.greenci.outputs.tests-failed }}
     steps:
       # Without this, a fork PR and an unconfigured repo both look like a
       # genuine failure. Say which it is.
@@ -169,6 +191,7 @@ jobs:
           persist-credentials: false
 
       - name: Run GreenCI
+        id: greenci
         if: env.HAS_API_KEY == 'yes'
         uses: ./.greenci-action
         with:
@@ -181,3 +204,31 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
           TEST_USER_EMAIL: ${{ secrets.TEST_USER_EMAIL }}
           TEST_USER_PASSWORD: ${{ secrets.TEST_USER_PASSWORD }}
+
+      # Runs only when the earlier steps succeeded: a failed run is already
+      # red. An empty count (the action set no output) is treated as 0. A
+      # caller that requires tests also fails when the run was skipped for a
+      # missing API key, because a skipped run generated nothing.
+      - name: Require generated tests
+        if: ${{ inputs.min-tests-generated > 0 }}
+        env:
+          GENERATED: ${{ steps.greenci.outputs.tests-generated }}
+          MINIMUM: ${{ inputs.min-tests-generated }}
+        run: |
+          if [[ ! "$MINIMUM" =~ ^[0-9]+$ ]]; then
+            echo "::error::min-tests-generated must be a whole number, got '$MINIMUM'"; exit 1
+          fi
+          generated="${GENERATED:-0}"
+          if [[ ! "$generated" =~ ^[0-9]+$ ]]; then
+            echo "::error::GreenCI reported a tests-generated count that is not a number: '$generated'"; exit 1
+          fi
+          if [[ "$HAS_API_KEY" != 'yes' ]]; then
+            echo "::error title=GreenCI did not run::This caller requires at least $MINIMUM generated test(s), but GREENCI_API_KEY is not set, so GreenCI was skipped."
+            exit 1
+          fi
+          # 10# forces base 10: a count such as 08 is otherwise read as octal.
+          if (( 10#$generated < 10#$MINIMUM )); then
+            echo "::error title=GreenCI generated too few tests::Generated $generated, this caller requires at least $MINIMUM. The model may have declined the diff as untestable; see the GreenCI step log."
+            exit 1
+          fi
+          echo "GreenCI generated $generated test(s); minimum is $MINIMUM."
