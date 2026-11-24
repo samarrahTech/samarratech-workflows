@@ -1,0 +1,218 @@
+name: Heldfix live scan
+
+# Reusable post-deploy Heldfix scan of a live site (platform spec §6 E4):
+# scan production, diff it with the previous scan of the same site, and post
+# to Slack when a new Tier 0 or Tier 1 finding appears. Call it from a deploy
+# workflow, after the production deploy job.
+#
+# Read-only: it never commits or opens PRs. Advisory: findings never fail the
+# job, only a tool failure does.
+#
+# The previous scan lives in the Actions cache of the caller repo (one entry
+# per run, restored by prefix), so the first run on a site only records a
+# baseline. Caches are scoped to the branch that wrote them; call this from
+# the default branch.
+#
+# Callers need:
+#   - secrets.HELDFIX_REPO_TOKEN: read-only token for the private
+#     samarrahTech/heldfix repo (Contents: read). Without it the job explains
+#     the skip and passes.
+#   - secrets.SLACK_WEBHOOK_URL (optional): where new-finding alerts go.
+#     Without it the job still scans and writes the run summary.
+
+on:
+  workflow_call:
+    inputs:
+      site-url:
+        description: The live production site, e.g. https://samarrahtech.com/
+        type: string
+        required: true
+      max-pages:
+        description: Page cap for the scan
+        type: number
+        default: 30
+      heldfix-ref:
+        description: samarrahTech/heldfix ref to run. `main` until Heldfix has a tagged release.
+        type: string
+        default: main
+    outputs:
+      new-t01-count:
+        description: Number of new Tier 0 and Tier 1 findings since the previous scan (empty when skipped or when no baseline existed)
+        value: ${{ jobs.scan.outputs.new-t01 }}
+    secrets:
+      HELDFIX_REPO_TOKEN:
+        required: false
+      SLACK_WEBHOOK_URL:
+        required: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # No repository permissions: the job renders the live pages in Chromium.
+    # The cache actions authenticate with the runner's own token.
+    permissions: {}
+    # One scan per site at a time, in order: two deploys in flight would both
+    # restore the same baseline, and the later save would win regardless of order.
+    concurrency:
+      group: heldfix-live-${{ github.repository }}-${{ inputs.site-url }}
+      cancel-in-progress: false
+    env:
+      # The `secrets` context is not available in `if:`, so presence checks go through env.
+      HAS_TOKEN: ${{ secrets.HELDFIX_REPO_TOKEN != '' && 'yes' || 'no' }}
+      OUT: ${{ github.workspace }}/heldfix-live
+    outputs:
+      new-t01: ${{ steps.diff.outputs.new-t01 }}
+    steps:
+      - name: Explain why Heldfix was skipped
+        if: env.HAS_TOKEN != 'yes'
+        run: |
+          echo "::notice title=Heldfix skipped::HELDFIX_REPO_TOKEN is not set for this run." \
+               "Add a read-only token for samarrahTech/heldfix as the HELDFIX_REPO_TOKEN secret."
+
+      # Inputs go through env, never interpolated into the script body.
+      - name: Check inputs
+        id: inputs
+        if: env.HAS_TOKEN == 'yes'
+        env:
+          SITE_URL: ${{ inputs.site-url }}
+          MAX_PAGES: ${{ inputs.max-pages }}
+          HELDFIX_REF: ${{ inputs.heldfix-ref }}
+        run: |
+          if [[ ! "$SITE_URL" =~ ^https://[A-Za-z0-9.-]+(:[0-9]+)?(/[^[:space:]]*)?$ ]]; then
+            echo "::error::site-url must be an https URL, got '$SITE_URL'"; exit 1
+          fi
+          if [[ ! "$MAX_PAGES" =~ ^[0-9]+$ ]] || (( 10#$MAX_PAGES < 1 || 10#$MAX_PAGES > 100 )); then
+            echo "::error::max-pages must be a whole number from 1 to 100, got '$MAX_PAGES'"; exit 1
+          fi
+          if [[ ! "$HELDFIX_REF" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ || "$HELDFIX_REF" == *..* ]]; then
+            echo "::error::heldfix-ref must be a branch, tag or sha, got '$HELDFIX_REF'"; exit 1
+          fi
+          site="${SITE_URL#https://}"; site="${site%%/*}"; site="${site//:/_}"
+          echo "site=$site" >> "$GITHUB_OUTPUT"
+
+      - name: Restore the previous scan
+        if: env.HAS_TOKEN == 'yes'
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ env.OUT }}/previous
+          # One entry per run; the prefix restores the newest one.
+          key: heldfix-live-${{ steps.inputs.outputs.site }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: heldfix-live-${{ steps.inputs.outputs.site }}-
+
+      - name: Fetch Heldfix
+        if: env.HAS_TOKEN == 'yes'
+        uses: actions/checkout@v7
+        with:
+          repository: samarrahTech/heldfix
+          ref: ${{ inputs.heldfix-ref }}
+          token: ${{ secrets.HELDFIX_REPO_TOKEN }}
+          path: .heldfix
+          persist-credentials: false
+
+      - uses: actions/setup-node@v7
+        if: env.HAS_TOKEN == 'yes'
+        with:
+          node-version-file: .heldfix/package.json
+          cache: npm
+          cache-dependency-path: .heldfix/package-lock.json
+
+      - name: Install Heldfix and Chromium
+        if: env.HAS_TOKEN == 'yes'
+        working-directory: .heldfix
+        run: |
+          npm ci
+          # playwright-core is the locked dependency; `npx playwright` would
+          # fetch whatever `playwright` is latest on npm.
+          node_modules/.bin/playwright-core install --with-deps chromium
+
+      - name: Scan the live site and diff with the previous scan
+        id: diff
+        if: env.HAS_TOKEN == 'yes'
+        working-directory: .heldfix
+        env:
+          SITE_URL: ${{ inputs.site-url }}
+          MAX_PAGES: ${{ inputs.max-pages }}
+        run: |
+          set -euo pipefail
+          SEO_AUTOFIX_BROWSER="$(ls -d ~/.cache/ms-playwright/chromium-*/chrome-linux*/chrome | sort -V | tail -1)"
+          export SEO_AUTOFIX_BROWSER
+          heldfix() { node_modules/.bin/tsx src/cli/main.ts "$@"; }
+          mkdir -p "$OUT/previous"
+          # --decisions none: owner decisions live in the private pilots repo.
+          head=$(heldfix scan "$SITE_URL" --max-pages "$MAX_PAGES" --perf none --decisions none --out "$OUT/scans" --json)
+          ok=$(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).summary.pagesOk)' "$head")
+          if (( ok == 0 )); then
+            echo "::error title=Heldfix scan incomplete::The scan of $SITE_URL loaded no page."; exit 1
+          fi
+          prev="$OUT/previous/scan.json"
+          count_t01() { node -e 'const f=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).findings; console.log(f.filter((x)=>x.status!=="suppressed"&&x.tier<=1).length)' "$1"; }
+          if [[ ! -f "$prev" ]]; then
+            # First run, or the cache entry was evicted (7 days unused). Nothing to
+            # diff against, so report the current Tier 0/1 count once instead of
+            # staying silent about whatever this deploy introduced.
+            echo "No previous scan of this site: this run records the baseline." | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "new-t01=" >> "$GITHUB_OUTPUT"
+            echo "baseline-t01=$(count_t01 "$head")" >> "$GITHUB_OUTPUT"
+          else
+            prev_ok=$(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).summary.pagesOk)' "$prev")
+            if (( ok * 2 < prev_ok )); then
+              # A partial scan (timeouts, rate limits) must not become the baseline:
+              # the next full scan would report every page it missed as new.
+              echo "::warning title=Heldfix partial scan::Loaded $ok pages, previous scan loaded $prev_ok. Keeping the previous baseline; no alert."
+              echo "new-t01=" >> "$GITHUB_OUTPUT"
+              echo "keep-baseline=yes" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            heldfix diff "$prev" "$head" > "$OUT/diff.md"
+            # Lines of the diff's "## New" section for Tier 0 and Tier 1 findings.
+            awk '/^## /{s=($0=="## New")} s && /^- / && /\(T[01],/' "$OUT/diff.md" > "$OUT/new-t01.txt"
+            echo "new-t01=$(wc -l < "$OUT/new-t01.txt" | tr -d ' ')" >> "$GITHUB_OUTPUT"
+            { echo "## Heldfix live scan: $SITE_URL"; echo; tail -n +2 "$OUT/diff.md" | sed -E 's/^## /### /'; } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          # This scan becomes the next run's baseline.
+          cp "$head" "$prev"
+
+      - name: Post new Tier 0/1 findings to Slack
+        # A Slack failure must not stop the baseline save below.
+        continue-on-error: true
+        if: >-
+          env.HAS_TOKEN == 'yes' && (
+            (steps.diff.outputs.new-t01 != '' && steps.diff.outputs.new-t01 != '0') ||
+            (steps.diff.outputs.baseline-t01 != '' && steps.diff.outputs.baseline-t01 != '0'))
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SITE_URL: ${{ inputs.site-url }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SHA: ${{ github.sha }}
+          BASELINE_T01: ${{ steps.diff.outputs.baseline-t01 }}
+        run: |
+          if [[ -z "${SLACK_WEBHOOK_URL:-}" ]]; then
+            echo "::notice title=Slack skipped::SLACK_WEBHOOK_URL is not set; new findings are in the run summary."; exit 0
+          fi
+          # node builds the JSON body, and Slack's <, > and & are escaped so page
+          # text cannot ping a channel or forge a link.
+          node -e '
+            const fs = require("fs");
+            const esc = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+            const site = esc(process.env.SITE_URL), sha = process.env.SHA.slice(0, 7);
+            let text;
+            if (process.env.BASELINE_T01) {
+              text = `:mag: Heldfix: no previous scan of ${site}, so this deploy (${sha}) set a new baseline with ${process.env.BASELINE_T01} open Tier 0/1 finding(s). Details in the run.\n${process.env.RUN_URL}`;
+            } else {
+              const lines = fs.readFileSync(process.argv[1], "utf8").trim().split("\n");
+              const shown = lines.slice(0, 10).map((l) => esc(l.slice(0, 200)));
+              const more = lines.length > 10 ? `\n...and ${lines.length - 10} more` : "";
+              text = `:mag: Heldfix: ${lines.length} new Tier 0/1 finding(s) on ${site} after deploy ${sha}\n${shown.join("\n")}${more}\n${process.env.RUN_URL}`;
+            }
+            fetch(process.env.SLACK_WEBHOOK_URL, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ text }), signal: AbortSignal.timeout(10000) })
+              .then((r) => { if (!r.ok) { console.error("Slack answered", r.status); process.exit(1); } })
+              .catch((e) => { console.error("Slack request failed:", e.name); process.exit(1); });
+          ' "$OUT/new-t01.txt"
+
+      - name: Save this scan as the next baseline
+        if: env.HAS_TOKEN == 'yes' && steps.diff.outcome == 'success' && steps.diff.outputs.keep-baseline != 'yes'
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ env.OUT }}/previous
+          key: heldfix-live-${{ steps.inputs.outputs.site }}-${{ github.run_id }}-${{ github.run_attempt }}
