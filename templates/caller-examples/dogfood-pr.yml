@@ -1,8 +1,9 @@
 # PR dogfood for a Cloudflare Pages site: deploy a preview of the PR, then run
-# GreenCI against it. Save as .github/workflows/dogfood.yml.
+# GreenCI and Heldfix against it. Save as .github/workflows/dogfood.yml.
 #
-# Both `uses:` lines must point at a ref that has greenci.yml and the `branch`
-# input (added Nov 2026). Use the same ref for both.
+# All three `uses:` lines must point at a ref that has greenci.yml,
+# heldfix-check.yml and the `branch` input (added Nov 2026). Use the same ref
+# for all three.
 name: Dogfood
 
 on:
@@ -42,3 +43,15 @@ jobs:
       base-url: ${{ needs.preview.outputs.deployment-url }}
     secrets:
       GREENCI_API_KEY: ${{ secrets.GREENCI_API_KEY }}
+
+  heldfix:
+    needs: preview
+    permissions:
+      contents: read
+      pull-requests: write
+    uses: samarrahTech/samarratech-workflows/.github/workflows/heldfix-check.yml@v1
+    with:
+      preview-url: ${{ needs.preview.outputs.deployment-url }}
+      baseline-url: https://example.com/ # this site's production URL
+    secrets:
+      HELDFIX_REPO_TOKEN: ${{ secrets.HELDFIX_REPO_TOKEN }}
