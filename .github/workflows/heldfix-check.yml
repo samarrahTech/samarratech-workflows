@@ -1,0 +1,291 @@
+name: Heldfix check
+
+# Reusable Heldfix SEO check for a pull request: scan production and the PR's
+# preview deployment, diff the two with `heldfix diff`, and keep one PR comment
+# up to date with what the change adds, fixes, or leaves as it was.
+#
+# Read-only by design: it never commits, never opens a PR, and only writes the
+# one comment. Advisory: findings never fail the job, only a tool failure does.
+#
+# Callers need:
+#   - secrets.HELDFIX_REPO_TOKEN: a read-only token for the private
+#     samarrahTech/heldfix repo (fine-grained, Contents: read), until Heldfix
+#     ships as a published action. Without it the job explains the skip and
+#     passes, so fork and Dependabot PRs (which get no secrets) stay green.
+#   - job permissions `contents: read` and `pull-requests: write` on the
+#     calling job. A reusable workflow cannot hold more than its caller grants.
+#   - preview-url: usually deploy-cf-pages.yml's `deployment-url` output.
+#
+# Call it from a `pull_request` workflow. Fork PRs are skipped: the scan runs
+# a headless browser on the PR's own pages while holding a token.
+#
+# Two jobs, so the one that renders untrusted pages holds no repository
+# permissions: `scan` (HELDFIX_REPO_TOKEN only, to fetch Heldfix) writes the
+# diff to an artifact, and `comment` (pull-requests: write, no secrets) posts
+# it. A failed scan replaces the comment with a failure note, so a stale
+# result never reads as current.
+#
+# The preview is scanned with `--preview-of <baseline-url>`: host-level checks
+# (redirects, HSTS, sitemap host, duplicate host) are skipped there, and URLs
+# that name the production host are read as the same path on the preview.
+
+on:
+  workflow_call:
+    inputs:
+      preview-url:
+        description: The PR's preview deployment (e.g. https://pr-12.<project>.pages.dev)
+        type: string
+        required: true
+      baseline-url:
+        description: The production site the preview is compared with
+        type: string
+        required: true
+      max-pages:
+        description: Page cap for each of the two scans
+        type: number
+        default: 30
+      heldfix-ref:
+        description: samarrahTech/heldfix ref to run. `main` until Heldfix has a tagged release.
+        type: string
+        default: main
+    outputs:
+      new-findings:
+        description: |
+          Findings on the preview that production does not have (empty when
+          skipped). A persisting finding that spreads to more pages on the
+          preview is not counted here; the comment lists it under "pages changed".
+        value: ${{ jobs.scan.outputs.new }}
+      resolved-findings:
+        description: Production findings the preview no longer has
+        value: ${{ jobs.scan.outputs.resolved }}
+      pages-added:
+        description: Findings production already has that reach more pages on the preview
+        value: ${{ jobs.scan.outputs.pages-added }}
+    secrets:
+      HELDFIX_REPO_TOKEN:
+        required: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    # No repository permissions: this job renders the PR's pages in Chromium.
+    permissions: {}
+    env:
+      # The `secrets` context is not available in `if:`, so the presence check
+      # goes through env.
+      HAS_TOKEN: ${{ secrets.HELDFIX_REPO_TOKEN != '' && 'yes' || 'no' }}
+      IS_FORK: ${{ github.event.pull_request.head.repo.full_name != '' && github.event.pull_request.head.repo.full_name != github.repository && 'yes' || 'no' }}
+      # Not a dot-directory: upload-artifact skips hidden paths by default.
+      OUT: ${{ github.workspace }}/heldfix-out
+    outputs:
+      ran: ${{ steps.inputs.outputs.ran }}
+      site: ${{ steps.inputs.outputs.site }}
+      artifact: ${{ steps.inputs.outputs.artifact }}
+      new: ${{ steps.scan.outputs.new }}
+      resolved: ${{ steps.scan.outputs.resolved }}
+      pages-added: ${{ steps.scan.outputs.pages-added }}
+    steps:
+      - name: Explain why Heldfix was skipped
+        if: env.HAS_TOKEN != 'yes' || env.IS_FORK == 'yes'
+        run: |
+          if [[ "$IS_FORK" == 'yes' ]]; then
+            echo "::notice title=Heldfix skipped::Pull requests from forks are not scanned."
+          else
+            echo "::notice title=Heldfix skipped::HELDFIX_REPO_TOKEN is not set for this run." \
+                 "Dependabot pull requests do not receive secrets, which is expected." \
+                 "Otherwise add a read-only token for samarrahTech/heldfix as the HELDFIX_REPO_TOKEN secret."
+          fi
+
+      # Inputs go through env, never interpolated into the script body
+      # (github.com/github/docs — script injection).
+      - name: Check inputs
+        id: inputs
+        if: env.HAS_TOKEN == 'yes' && env.IS_FORK != 'yes'
+        env:
+          PREVIEW_URL: ${{ inputs.preview-url }}
+          BASELINE_URL: ${{ inputs.baseline-url }}
+          MAX_PAGES: ${{ inputs.max-pages }}
+          HELDFIX_REF: ${{ inputs.heldfix-ref }}
+        run: |
+          url_re='^https://[A-Za-z0-9.-]+(:[0-9]+)?(/[^[:space:]]*)?$'
+          if [[ ! "$BASELINE_URL" =~ $url_re ]]; then
+            echo "::error::baseline-url must be an https URL, got '$BASELINE_URL'"; exit 1
+          fi
+          # One caller workflow may check several sites: the production host keys
+          # the PR comment and the artifact name so the calls do not collide.
+          site="${BASELINE_URL#https://}"; site="${site%%/*}"; site="${site//:/_}"
+          echo "site=$site" >> "$GITHUB_OUTPUT"
+          # Named here so a re-run of the comment job alone (a later run_attempt)
+          # still downloads the artifact this scan attempt uploaded.
+          echo "artifact=heldfix-check-$site-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
+          # From here on the comment job reports this run, success or failure, so a
+          # missing preview URL on a later push replaces an earlier result.
+          echo "ran=yes" >> "$GITHUB_OUTPUT"
+          if [[ ! "$PREVIEW_URL" =~ $url_re ]]; then
+            echo "::error::preview-url must be an https URL, got '$PREVIEW_URL'. If it comes from a preview deploy job, that job produced no deployment-url."; exit 1
+          fi
+          if [[ ! "$MAX_PAGES" =~ ^[0-9]+$ ]] || (( 10#$MAX_PAGES < 1 || 10#$MAX_PAGES > 100 )); then
+            echo "::error::max-pages must be a whole number from 1 to 100, got '$MAX_PAGES'"; exit 1
+          fi
+          if [[ ! "$HELDFIX_REF" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ || "$HELDFIX_REF" == *..* ]]; then
+            echo "::error::heldfix-ref must be a branch, tag or sha, got '$HELDFIX_REF'"; exit 1
+          fi
+
+      - name: Fetch Heldfix
+        if: steps.inputs.outputs.ran == 'yes'
+        uses: actions/checkout@v7
+        with:
+          repository: samarrahTech/heldfix
+          ref: ${{ inputs.heldfix-ref }}
+          token: ${{ secrets.HELDFIX_REPO_TOKEN }}
+          path: .heldfix
+          persist-credentials: false
+
+      - uses: actions/setup-node@v7
+        if: steps.inputs.outputs.ran == 'yes'
+        with:
+          node-version-file: .heldfix/package.json
+          cache: npm
+          cache-dependency-path: .heldfix/package-lock.json
+
+      - name: Install Heldfix and Chromium
+        if: steps.inputs.outputs.ran == 'yes'
+        working-directory: .heldfix
+        run: |
+          npm ci
+          # playwright-core is the locked dependency; `npx playwright` would fetch
+          # whatever `playwright` is latest on npm, outside the lockfile.
+          node_modules/.bin/playwright-core install --with-deps chromium
+
+      - name: Scan production and the preview, then diff
+        id: scan
+        if: steps.inputs.outputs.ran == 'yes'
+        working-directory: .heldfix
+        env:
+          PREVIEW_URL: ${{ inputs.preview-url }}
+          BASELINE_URL: ${{ inputs.baseline-url }}
+          MAX_PAGES: ${{ inputs.max-pages }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          SEO_AUTOFIX_BROWSER="$(ls -d ~/.cache/ms-playwright/chromium-*/chrome-linux*/chrome | sort -V | tail -1)"
+          export SEO_AUTOFIX_BROWSER
+          heldfix() { node_modules/.bin/tsx src/cli/main.ts "$@"; }
+          # A scan that reached no page still exits 0. Diffing it would report every
+          # finding on the other side as fixed or new, so stop here instead.
+          require_pages() {
+            local ok
+            ok=$(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).summary.pagesOk)' "$1")
+            if (( ok == 0 )); then
+              echo "::error title=Heldfix scan incomplete::The scan of $2 loaded no page. Is it reachable from GitHub runners?"; exit 1
+            fi
+          }
+          mkdir -p "$OUT"
+          # --decisions none: owner decisions live in the private pilots repo, not here.
+          base=$(heldfix scan "$BASELINE_URL" --max-pages "$MAX_PAGES" --perf none --decisions none --out "$OUT/scans" --json)
+          require_pages "$base" "$BASELINE_URL"
+          head=$(heldfix scan "$PREVIEW_URL" --preview-of "$BASELINE_URL" --max-pages "$MAX_PAGES" --perf none --decisions none --out "$OUT/scans" --json)
+          require_pages "$head" "$PREVIEW_URL"
+          heldfix diff "$base" "$head" > "$OUT/diff.md"
+          # "Resolved: 1 · New: 2 · Persisting: 3" is the diff's own count line.
+          counts=$(grep -m1 '^Resolved: ' "$OUT/diff.md")
+          echo "new=$(sed -E 's/.*New: ([0-9]+).*/\1/' <<<"$counts")" >> "$GITHUB_OUTPUT"
+          echo "resolved=$(sed -E 's/^Resolved: ([0-9]+).*/\1/' <<<"$counts")" >> "$GITHUB_OUTPUT"
+          # Lines of the "Persisting, with pages changed" section that gained a page.
+          echo "pages-added=$(grep -c ' new on ' "$OUT/diff.md" || true)" >> "$GITHUB_OUTPUT"
+
+          # Drop the diff's own title line (two scan ids) and put its `##` sections
+          # below the comment's `###` title.
+          tail -n +2 "$OUT/diff.md" | sed -E 's/^## /#### /' > "$OUT/comment-body.md"
+          # Title, context line, the given body, footer.
+          frame() {
+            echo "### Heldfix: preview vs production"
+            echo
+            echo "Preview: $PREVIEW_URL · Production: $BASELINE_URL · Commit: ${HEAD_SHA:0:7}"
+            cat "$1"
+            echo
+            echo "---"
+            echo "Advisory: this check never blocks a merge. Host-level checks (redirects, HSTS, sitemap host, duplicate host) are skipped on previews. [Run]($RUN_URL)"
+          }
+          # GitHub caps a comment at 65,536 characters. Cut at a line boundary so
+          # no line (or multi-byte character) is left half-written.
+          body="$OUT/comment-body.md"
+          if (( $(wc -c < "$body") > 60000 )); then
+            {
+              head -c 60000 "$OUT/comment-body.md" | sed '$d'
+              echo
+              echo "_Truncated: the full diff is in the run summary and the heldfix-check artifact._"
+            } > "$OUT/comment-body-short.md"
+            body="$OUT/comment-body-short.md"
+          fi
+          frame "$body" > "$OUT/comment.md"
+          # The run summary gets the full, untruncated diff.
+          frame "$OUT/comment-body.md" | sed -E 's/^### /## /; s/^#### /### /' >> "$GITHUB_STEP_SUMMARY"
+
+      # The comment job reads comment.md from here. The scan JSON is also kept for
+      # the weekly dogfood triage (platform spec E5); HTML snapshots are large and
+      # reproducible, so they are left out.
+      - name: Keep the scans
+        if: always() && steps.inputs.outputs.ran == 'yes'
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.inputs.outputs.artifact }}
+          path: |
+            ${{ env.OUT }}
+            !${{ env.OUT }}/**/html/**
+          retention-days: 14
+          if-no-files-found: ignore
+
+  comment:
+    needs: scan
+    # Runs after a failed scan too, so the comment never keeps an old result.
+    # Not after a cancelled run: a caller's cancel-in-progress cancels on every
+    # push, and the newer run will post its own result.
+    if: ${{ !cancelled() && github.event_name == 'pull_request' && needs.scan.outputs.ran == 'yes' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # No secrets and no checkout: this job only posts what the scan job wrote.
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Fetch the scan result
+        if: needs.scan.result == 'success'
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ needs.scan.outputs.artifact }}
+          path: heldfix-out
+
+      - name: Comment on the pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          SITE: ${{ needs.scan.outputs.site }}
+          SCAN_RESULT: ${{ needs.scan.result }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          # Keyed by production host: a caller that checks two sites keeps two comments.
+          marker="<!-- heldfix-check:$SITE -->"
+          if [[ "$SCAN_RESULT" == 'success' ]]; then
+            { echo "$marker"; cat heldfix-out/comment.md; } > comment.md
+          else
+            {
+              echo "$marker"
+              echo "### Heldfix: preview vs production"
+              echo
+              echo "The Heldfix check on ${HEAD_SHA:0:7} did not finish ($SCAN_RESULT), so there is no current result. [Run]($RUN_URL)"
+            } > comment.md
+          fi
+          # One comment per PR and site, edited in place on every push. `sed -n 1p`
+          # reads all of gh's output, so a second match cannot SIGPIPE gh under pipefail.
+          id=$(gh api "repos/$REPO/issues/$PR/comments" --paginate \
+                 --jq ".[] | select(.user.login == \"github-actions[bot]\" and (.body | startswith(\"$marker\"))) | .id" | sed -n 1p)
+          if [[ -n "$id" ]]; then
+            gh api --method PATCH "repos/$REPO/issues/comments/$id" -F body=@comment.md > /dev/null
+          else
+            gh api --method POST "repos/$REPO/issues/$PR/comments" -F body=@comment.md > /dev/null
+          fi
