@@ -80,34 +80,60 @@ on:
         required: false
 
 jobs:
+  # Decides once whether GreenCI can run, instead of a key check on every
+  # step of the run job (a step added without it would turn the fork-PR skip
+  # into a failure). Holds no repository permissions.
+  # When the key is missing the run job is skipped, and a skipped job counts
+  # as passing a required check: a caller that requires tests must require
+  # the `gate` check too, since that is where the missing-key failure shows.
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    outputs:
+      has-key: ${{ steps.key.outputs.has-key }}
+    steps:
+      - name: Check for the GreenCI API key
+        id: key
+        env:
+          # The `secrets` context is not available in `if:`, so the presence
+          # check goes through env.
+          HAS_API_KEY: ${{ secrets.GREENCI_API_KEY != '' && 'yes' || 'no' }}
+          MINIMUM: ${{ inputs.min-tests-generated }}
+        run: |
+          if [[ ! "$MINIMUM" =~ ^[0-9]+$ ]]; then
+            echo "::error::min-tests-generated must be a whole number, got '$MINIMUM'"; exit 1
+          fi
+          echo "has-key=$HAS_API_KEY" >> "$GITHUB_OUTPUT"
+          [[ "$HAS_API_KEY" == 'yes' ]] && exit 0
+          # Without this, a fork PR and an unconfigured repo both look like a
+          # genuine failure. Say which it is.
+          echo "::notice title=GreenCI skipped::GREENCI_API_KEY is not set for this run." \
+               "Fork pull requests do not receive secrets, which is expected." \
+               "If this is not a fork, add the GREENCI_API_KEY repository secret."
+          # A caller that requires tests fails when the run is skipped, because
+          # a skipped run generated nothing.
+          if (( 10#$MINIMUM > 0 )); then
+            echo "::error title=GreenCI did not run::This caller requires at least $MINIMUM generated test(s), but GREENCI_API_KEY is not set, so GreenCI was skipped."
+            exit 1
+          fi
+
   greenci:
+    needs: gate
+    if: needs.gate.outputs.has-key == 'yes'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
       contents: read
       pull-requests: write
-    env:
-      # The `secrets` context is not available in `if:`, so the presence check
-      # goes through env.
-      HAS_API_KEY: ${{ secrets.GREENCI_API_KEY != '' && 'yes' || 'no' }}
     outputs:
       tests-generated: ${{ steps.greenci.outputs.tests-generated }}
       tests-passed: ${{ steps.greenci.outputs.tests-passed }}
       tests-failed: ${{ steps.greenci.outputs.tests-failed }}
     steps:
-      # Without this, a fork PR and an unconfigured repo both look like a
-      # genuine failure. Say which it is.
-      - name: Explain why GreenCI was skipped
-        if: env.HAS_API_KEY != 'yes'
-        run: |
-          echo "::notice title=GreenCI skipped::GREENCI_API_KEY is not set for this run." \
-               "Fork pull requests do not receive secrets, which is expected." \
-               "If this is not a fork, add the GREENCI_API_KEY repository secret."
-
       # Inputs go through env, never interpolated into the script body
       # (github.com/github/docs — script injection).
       - name: Check inputs
-        if: env.HAS_API_KEY == 'yes'
         env:
           CHANNEL: ${{ inputs.channel }}
           APP_URL: ${{ inputs.base-url }}
@@ -121,29 +147,26 @@ jobs:
           esac
 
       - uses: actions/checkout@v7
-        if: env.HAS_API_KEY == 'yes'
         with:
           # This job runs model-written test code. Do not leave the repo token
           # in .git/config where that code can read it.
           persist-credentials: false
 
       - uses: actions/setup-node@v7
-        if: env.HAS_API_KEY == 'yes'
         with:
           node-version-file: package.json
           cache: npm
 
       - run: npm ci
-        if: env.HAS_API_KEY == 'yes'
 
       - name: Set run env
-        if: ${{ env.HAS_API_KEY == 'yes' && inputs.run-env != '' }}
+        if: ${{ inputs.run-env != '' }}
         env:
           RUN_ENV: ${{ inputs.run-env }}
         run: printf '%s\n' "$RUN_ENV" >> "$GITHUB_ENV"
 
       - name: Build
-        if: ${{ env.HAS_API_KEY == 'yes' && inputs.build-command != '' }}
+        if: ${{ inputs.build-command != '' }}
         env:
           BUILD_COMMAND: ${{ inputs.build-command }}
         run: eval "$BUILD_COMMAND"
@@ -151,7 +174,6 @@ jobs:
       # Start and wait in one step: if the start command dies, the step fails
       # right away instead of after a wait-on timeout in a later step.
       - name: Start the app and wait for it
-        if: env.HAS_API_KEY == 'yes'
         env:
           START_COMMAND: ${{ inputs.start-command }}
           APP_URL: ${{ inputs.base-url }}
@@ -182,7 +204,6 @@ jobs:
       # The action commits through the GitHub API by file path, so this
       # directory never reaches the PR branch.
       - name: Fetch greenci-action
-        if: env.HAS_API_KEY == 'yes'
         uses: actions/checkout@v7
         with:
           repository: samarrahTech/greenci-action
@@ -192,7 +213,6 @@ jobs:
 
       - name: Run GreenCI
         id: greenci
-        if: env.HAS_API_KEY == 'yes'
         uses: ./.greenci-action
         with:
           api-key: ${{ secrets.GREENCI_API_KEY }}
@@ -206,9 +226,8 @@ jobs:
           TEST_USER_PASSWORD: ${{ secrets.TEST_USER_PASSWORD }}
 
       # Runs only when the earlier steps succeeded: a failed run is already
-      # red. An empty count (the action set no output) is treated as 0. A
-      # caller that requires tests also fails when the run was skipped for a
-      # missing API key, because a skipped run generated nothing.
+      # red. An empty count (the action set no output) is treated as 0. The
+      # missing-key case is failed by the gate job.
       - name: Require generated tests
         if: ${{ inputs.min-tests-generated > 0 }}
         env:
@@ -221,10 +240,6 @@ jobs:
           generated="${GENERATED:-0}"
           if [[ ! "$generated" =~ ^[0-9]+$ ]]; then
             echo "::error::GreenCI reported a tests-generated count that is not a number: '$generated'"; exit 1
-          fi
-          if [[ "$HAS_API_KEY" != 'yes' ]]; then
-            echo "::error title=GreenCI did not run::This caller requires at least $MINIMUM generated test(s), but GREENCI_API_KEY is not set, so GreenCI was skipped."
-            exit 1
           fi
           # 10# forces base 10: a count such as 08 is otherwise read as octal.
           if (( 10#$generated < 10#$MINIMUM )); then
