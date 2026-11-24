@@ -1,0 +1,20 @@
+# Delete a PR's Cloudflare Pages preview deployments when the PR closes (the
+# previews dogfood-pr.yml creates). Save as .github/workflows/dogfood-cleanup.yml.
+# The Pages project must belong to this repo only: pr-<n> is this repo's PR n.
+name: Dogfood cleanup
+
+on:
+  pull_request:
+    types: [closed]
+
+jobs:
+  cleanup:
+    # Fork PRs never got a preview (and get no secrets).
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    # @main until cleanup-cf-pages-preview.yml is in the v1 tag (samarratech ST-072).
+    uses: samarrahTech/samarratech-workflows/.github/workflows/cleanup-cf-pages-preview.yml@main
+    with:
+      project-name: my-pages-project
+      branch: pr-${{ github.event.pull_request.number }}
+    secrets:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
